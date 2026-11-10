@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+*.tar.gz
+*.png
+.aws/
+*.pem
+*.key
+.DS_Store
+Thumbs.db

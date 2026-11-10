@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HTTPS HTTP API and Lambda proxy for SageMaker ResUNet synchronous JPEG to PNG segmentation.
+Parameters:
+  SageMakerEndpointName:
+    Type: String
+    MinLength: 1
+    Description: Name of the ACTIVE SageMaker real-time endpoint (from resunet-sagemaker-gpu stack output).
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 25
+    MinValue: 3
+    MaxValue: 29
+Resources:
+  ResUNetApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeOnlySelectedSageMakerEndpoint
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sagemaker:InvokeEndpoint
+                Resource: !Sub arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpointName}
+  ResUNetApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ResUNetApiLambdaRole.Arn
+      Timeout: !Ref LambdaTimeoutSeconds
+      MemorySize: 512
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Ref SageMakerEndpointName
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          import os
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError, BotoCoreError
+
+          runtime = boto3.client(
+              'sagemaker-runtime',
+              config=Config(connect_timeout=3, read_timeout=22, retries={'max_attempts': 1})
+          )
+          ENDPOINT = os.environ['SAGEMAKER_ENDPOINT_NAME']
+          MAX_INPUT_BYTES = 5 * 1024 * 1024
+
+          def error(status, message):
+              return {
+                  'statusCode': status,
+                  'headers': {'content-type': 'application/json', 'cache-control': 'no-store'},
+                  'body': json.dumps({'error': message}),
+                  'isBase64Encoded': False
+              }
+
+          def handler(event, context):
+              headers = {str(k).lower(): str(v) for k, v in (event.get('headers') or {}).items()}
+              content_type = headers.get('content-type', '').split(';', 1)[0].strip().lower()
+              if content_type != 'image/jpeg':
+                  return error(415, 'Content-Type must be image/jpeg')
+              if event.get('body') is None:
+                  return error(400, 'Missing JPEG request body')
+              try:
+                  if event.get('isBase64Encoded'):
+                      jpeg = base64.b64decode(event['body'], validate=True)
+                  else:
+                      # HTTP API proxy normally base64-encodes image/jpeg request bodies.
+                      # Reject unencoded strings rather than corrupting binary JPEG bytes.
+                      return error(400, 'Expected base64-encoded JPEG request body')
+              except (ValueError, TypeError) as exc:
+                  return error(400, 'Invalid request body encoding')
+              except Exception:
+                  return error(400, 'Invalid base64 request body')
+              if not jpeg or len(jpeg) > MAX_INPUT_BYTES:
+                  return error(413 if jpeg else 400, 'JPEG must be nonempty and at most 5 MiB')
+              if not jpeg.startswith(b'\xff\xd8\xff'):
+                  return error(400, 'Request body does not appear to be JPEG')
+              try:
+                  response = runtime.invoke_endpoint(
+                      EndpointName=ENDPOINT,
+                      ContentType='image/jpeg',
+                      Accept='image/png',
+                      Body=jpeg
+                  )
+                  png = response['Body'].read()
+                  if not png.startswith(b'\x89PNG\r\n\x1a\n'):
+                      raise ValueError('SageMaker returned a non-PNG response')
+                  return {
+                      'statusCode': 200,
+                      'headers': {'content-type': 'image/png', 'cache-control': 'no-store'},
+                      'isBase64Encoded': True,
+                      'body': base64.b64encode(png).decode('ascii')
+                  }
+              except (ClientError, BotoCoreError, ValueError) as exc:
+                  print('Inference failed:', type(exc).__name__, str(exc)[:500])
+                  return error(502, 'Model inference temporarily unavailable')
+  ResUNetHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: resunet-segmentation-api
+      ProtocolType: HTTP
+      Description: Public demonstration endpoint for JPEG to PNG dental segmentation. Add authentication before production use.
+  ResUNetHttpIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ResUNetHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ResUNetApiLambda.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+  ResUNetHttpRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ResUNetHttpApi
+      RouteKey: POST /api/v1/segment
+      Target: !Sub integrations/${ResUNetHttpIntegration}
+      AuthorizationType: NONE
+  ResUNetHttpStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ResUNetHttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
+  ResUNetApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ResUNetApiLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ResUNetHttpApi}/*/POST/api/v1/segment
+Outputs:
+  ApiUrl:
+    Description: Public HTTPS segmentation route
+    Value: !Sub https://${ResUNetHttpApi}.execute-api.${AWS::Region}.amazonaws.com/api/v1/segment
+  LambdaName:
+    Value: !Ref ResUNetApiLambda
+  ConfiguredSageMakerEndpoint:
+    Value: !Ref SageMakerEndpointName

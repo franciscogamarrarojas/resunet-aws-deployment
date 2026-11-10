@@ -1,0 +1,63 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ResUNet dental segmentation - versioned SageMaker GPU inference (no API Gateway yet)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: SageMaker execution role ARN with read access to the model artifact.
+  ModelBucket:
+    Type: String
+    Description: Existing S3 bucket containing the packaged model artifact.
+  ModelVersion:
+    Type: String
+    Default: v2
+    AllowedPattern: "v[0-9]+"
+    Description: Versioned model artifact under deployment/resunet/<version>/model.tar.gz
+  InferenceImageUri:
+    Type: String
+    Default: 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.6.0-gpu-py312-cu124-ubuntu22.04-sagemaker
+  InstanceType:
+    Type: String
+    Default: ml.g5.xlarge
+  DeployEndpoint:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Set to true ONLY when ready for hourly endpoint charges.
+Conditions:
+  CreateEndpoint: !Equals [!Ref DeployEndpoint, 'true']
+Resources:
+  ResUNetModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !Ref ExecutionRoleArn
+      PrimaryContainer:
+        Image: !Ref InferenceImageUri
+        ModelDataUrl: !Sub "s3://${ModelBucket}/deployment/resunet/${ModelVersion}/model.tar.gz"
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/model/code
+          SAGEMAKER_CONTAINER_LOG_LEVEL: '20'
+  ResUNetEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      ProductionVariants:
+        - VariantName: AllTraffic
+          ModelName: !GetAtt ResUNetModel.ModelName
+          InitialInstanceCount: 1
+          InstanceType: !Ref InstanceType
+          InitialVariantWeight: 1.0
+  ResUNetEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Condition: CreateEndpoint
+    Properties:
+      EndpointConfigName: !GetAtt ResUNetEndpointConfig.EndpointConfigName
+Outputs:
+  ModelName:
+    Value: !GetAtt ResUNetModel.ModelName
+  EndpointConfigName:
+    Value: !GetAtt ResUNetEndpointConfig.EndpointConfigName
+  EndpointName:
+    Condition: CreateEndpoint
+    Value: !GetAtt ResUNetEndpoint.EndpointName
+  ArtifactS3Uri:
+    Value: !Sub "s3://${ModelBucket}/deployment/resunet/${ModelVersion}/model.tar.gz"
